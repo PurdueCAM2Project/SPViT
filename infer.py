@@ -176,28 +176,77 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-def validate(val_loader, model, criterion):
-    batch_time = AverageMeter('Time', ':6.3f')
+def validate(args, val_loader, model, criterion):
+    batch_time = AverageMeter('Time (ms)', ':.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     model.eval()
+    
+    ### Create fabric instance
+    fabric = L.Fabric(
+        accelerator='cuda',
+        strategy='dp',
+        devices=1,
+        num_nodes=1,
+        precision='32',
+    )
+    fabric.launch()
 
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, losses, top1, top5],
-        prefix='Test: ')
+    ### Wrap model with fabric
+    model       = fabric.setup_module(model, move_to_device=True)
+    val_loader  = fabric.setup_dataloaders(val_loader, use_distributed_sampler=False, move_to_device=True)
+    
+    ### Use TQDM instead
+    tqdm_progress_bar = tqdm(val_loader)
 
+    ### Create torch.profiler instance
+    ### If we are using tensorboard, wrap evaluation calls with it
+    if args.eval_tensorboard:
+        torchprofiler = torch.profiler.profile(
+            ### Create profiler instance
+            activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+            schedule=torch.profiler.schedule(wait=24, warmup=25, active=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./bin/"),
+            record_shapes=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+        )
+
+        ### Start profiling!
+        torchprofiler.start()
+    else:
+        torchprofiler = None
+
+    ### Wait for profiler to be setup
+    time.sleep(5.0)
 
     with torch.no_grad():
-        end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            images = images.cuda()
-            target = target.cuda()
+        start_event             = torch.cuda.Event(enable_timing=True)
+        end_event               = torch.cuda.Event(enable_timing=True)
+
+        for batch_index, (images, target) in enumerate(tqdm_progress_bar):
+            ### Abort early 
+            if args.forward_pass_count is not None and batch_index > args.forward_pass_count:
+                print('infer.py: Exiting Early')
+                break
+
+            ### Simple Warmup 
+            if batch_index < 1:
+                for k in range(25):
+                    _ = model(images)
+                torch.cuda.synchronize()
+
+            ### Start recording
+            start_event.record()
 
             # compute output
-            output = model(images)
-            loss = criterion(output, target)
+            output  = model(images)
+            loss    = criterion(output, target)
+
+            end_event.record()
+            torch.cuda.synchronize()
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -206,15 +255,22 @@ def validate(val_loader, model, criterion):
             top5.update(acc5[0], images.size(0))
 
             # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+            batch_time.update( start_event.elapsed_time( end_event ) )
 
-            if i % 20 == 0:
-                progress.display(i)
+            tqdm_progress_bar.set_description(
+                desc='Acc@1 Avg: {:.2f} | Average Batch Time (ms): {:.2f}'.format(top1.avg, batch_time.avg),
+                refresh=True
+            )
 
-        # TODO: this should also be done with the ProgressMeter
-        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-              .format(top1=top1, top5=top5))
+            if torchprofiler is not None:
+                torchprofiler.step()
+
+        ###
+        ### Print info
+        ###
+        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'.format(top1=top1, top5=top5))
+        print('Average Batch Time: {:.3f}'.format(batch_time.avg))
+        print('Average Loss: {:.3f}'.format(losses.avg))
 
     return top1.avg
 
