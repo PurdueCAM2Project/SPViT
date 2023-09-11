@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import json
 
+import tqdm
+import lightning as L
+
 from pathlib import Path
 
 from timm.data import Mixup
